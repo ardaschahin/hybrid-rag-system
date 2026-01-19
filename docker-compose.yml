@@ -1,0 +1,111 @@
+services:
+  # --- Local LLM/VLM server (recommended for reviewers) ---
+  ollama:
+    image: ollama/ollama:latest
+    environment:
+      - OLLAMA_HOST=0.0.0.0:11434
+    volumes:
+      - ollama_data:/root/.ollama
+    # IMPORTANT: do NOT publish 11434 to host to avoid port conflicts
+    # ports:
+    #   - "11434:11434"
+
+  agent:
+    build:
+      context: .
+      dockerfile: agent/Dockerfile
+    environment:
+      # --- Telemetry off ---
+      CHROMA_TELEMETRY_DISABLED: "1"
+      ANONYMIZED_TELEMETRY: "FALSE"
+      CHROMA_TELEMETRY: "FALSE"
+      CHROMA_ANONYMIZED_TELEMETRY: "FALSE"
+
+      # LLM
+      LLM_PROVIDER: ${LLM_PROVIDER:-ollama}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://ollama:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.1:8b}
+      OLLAMA_TEMPERATURE: ${OLLAMA_TEMPERATURE:-0.1}
+      OLLAMA_NUM_PREDICT: ${OLLAMA_NUM_PREDICT:-180}
+      OLLAMA_TOP_P: ${OLLAMA_TOP_P:-0.9}
+      LLM_CONNECT_TIMEOUT: ${LLM_CONNECT_TIMEOUT:-5}
+      LLM_READ_TIMEOUT: ${LLM_READ_TIMEOUT:-120}
+
+      # Vector DB
+      CHROMA_PATH: /app/chroma_db
+      CHROMA_COLLECTION: ${CHROMA_COLLECTION:-docs}
+    volumes:
+      - ./chroma_db:/app/chroma_db
+    ports:
+      - "8001:8001"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - ollama
+    command: ["uvicorn", "agent.app.main:app", "--host", "0.0.0.0", "--port", "8001"]
+
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    environment:
+      AGENT_URL: http://agent:8001
+      JWT_SECRET: ${JWT_SECRET:-CHANGE_ME}
+      JWT_EXPIRE_MIN: ${JWT_EXPIRE_MIN:-240}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:8080,http://127.0.0.1:8080}
+    ports:
+      - "8000:8000"
+    depends_on:
+      - agent
+    command: ["uvicorn", "backend.app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+      args:
+        VITE_API_BASE: ${VITE_API_BASE:-http://localhost:8000}
+    ports:
+      - "8080:80"
+    depends_on:
+      - backend
+
+  # One-shot ingestion job (run manually)
+  ingest:
+    profiles: ["ingest"]
+    build:
+      context: .
+      dockerfile: ingest/Dockerfile
+    environment:
+      # --- Telemetry off ---
+      CHROMA_TELEMETRY_DISABLED: "1"
+      ANONYMIZED_TELEMETRY: "FALSE"
+      CHROMA_TELEMETRY: "FALSE"
+      CHROMA_ANONYMIZED_TELEMETRY: "FALSE"
+
+      CHROMA_PATH: /app/chroma_db
+      CHROMA_COLLECTION: ${CHROMA_COLLECTION:-docs}
+      EMBED_MODEL: ${EMBED_MODEL:-BAAI/bge-small-en-v1.5}
+
+      RESET_COLLECTION: ${RESET_COLLECTION:-0}
+
+      ENABLE_VLM_CAPTIONS: ${ENABLE_VLM_CAPTIONS:-0}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://ollama:11434}
+      OLLAMA_VLM_MODEL: ${OLLAMA_VLM_MODEL:-llava:13b}
+      VLM_TIMEOUT: ${VLM_TIMEOUT:-240}
+      VLM_MIN_CONFIDENCE: ${VLM_MIN_CONFIDENCE:-0.60}
+
+      CAPTION_DPI: ${CAPTION_DPI:-150}
+      CAPTION_MIN_IMAGE_COUNT: ${CAPTION_MIN_IMAGE_COUNT:-1}
+      CAPTION_MIN_DRAWING_COUNT: ${CAPTION_MIN_DRAWING_COUNT:-1}
+      CAPTION_USE_DRAWINGS: ${CAPTION_USE_DRAWINGS:-1}
+      CAPTION_USE_TEXT_CUES: ${CAPTION_USE_TEXT_CUES:-1}
+      CAPTION_MAX_PAGES: ${CAPTION_MAX_PAGES:-0}
+    volumes:
+      - ./chroma_db:/app/chroma_db
+      - ./data:/app/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+volumes:
+  ollama_data:
