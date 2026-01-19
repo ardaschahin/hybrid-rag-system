@@ -1,6 +1,6 @@
 import json
 import re
-from typing import TypedDict, List, Dict, Any, Optional, Tuple
+from typing import TypedDict, List, Dict, Any, Optional
 
 from langgraph.graph import StateGraph, END
 
@@ -17,7 +17,17 @@ VISUAL_INTENT_RE = re.compile(
 
 # Object-related intent (TR+EN)
 OBJ_INTENT_RE = re.compile(
-    r"\b(object|objects|layer|katman|type|tip|polyline|line|window|highway|kaç|adet|nesne|obje)\b",
+    r"\b(object|objects|session|object_list|layer|katman|type|tip|polyline|line|window|windows|highway|kaç|adet|nesne|obje|var mı|mevcut mu|bulunuyor mu)\b",
+    re.IGNORECASE,
+)
+
+# YES/NO / presence intent
+YESNO_INTENT_RE = re.compile(
+    r"\b(yes\/no|yes or no|reply with only (yes|no)|answer (yes|no)|evet\/hayir|evet mi hayir mi)\b",
+    re.IGNORECASE,
+)
+PRESENCE_INTENT_RE = re.compile(
+    r"\b(do i have|any object on|have any object|is there any|var mı|mevcut mu|bulunuyor mu)\b",
     re.IGNORECASE,
 )
 
@@ -28,9 +38,15 @@ DOC_RULE_INTENT_RE = re.compile(
 )
 
 # Extract explicit layer/type targets from question (dynamic mapping)
-LAYER_TARGET_RE = re.compile(
+# Case 1: "layer Windows" / "katman Highway"
+LAYER_TARGET_RE1 = re.compile(
     r"\b(?:layer|katman)\s*[:=]?\s*([A-Za-z0-9_\- ]{2,40})\b", re.IGNORECASE
 )
+# Case 2: 'on the "Highway" layer'  (layer comes AFTER the name)
+LAYER_TARGET_RE2 = re.compile(
+    r"\"?([A-Za-z0-9_\- ]{2,40})\"?\s+(?:layer|katman)\b", re.IGNORECASE
+)
+
 TYPE_TARGET_RE = re.compile(
     r"\b(?:type|tip)\s*[:=]?\s*([A-Za-z0-9_\-]{2,30})\b", re.IGNORECASE
 )
@@ -106,17 +122,23 @@ def _clean_ws(s: str) -> str:
 
 def _extract_layer_target(q: str) -> Optional[str]:
     """
-    Try to extract explicit layer name from question like:
+    Extract explicit layer name from question like:
     - "layer Windows"
     - "katman Highway"
-    - "layer: MyLayer"
+    - 'on the "Highway" layer'
     """
-    m = LAYER_TARGET_RE.search(q or "")
+    q = q or ""
+    m = LAYER_TARGET_RE1.search(q)
+    if not m:
+        m = LAYER_TARGET_RE2.search(q)
     if not m:
         return None
+
     name = _clean_ws(m.group(1))
     # trim trailing common words
     name = re.sub(r"\b(objects|objeler|count|kaç|adet)\b$", "", name, flags=re.IGNORECASE).strip()
+    # remove stray quotes if any
+    name = name.strip('"').strip("'").strip()
     return name or None
 
 
@@ -199,22 +221,27 @@ def node_router(state: GraphState) -> GraphState:
     else:
         filtered = (txts[:5] if txts else hits[:5])
 
-    # ---- Decide strategy ----
+    # ---- Decide baseline strategy ----
     strategy = "caption+text" if visual and caps else ("text_only" if not visual else "visual_no_caption_shortcircuit")
 
-    # ✅ NEW: compute dynamic targets once, store in plan
+    # compute dynamic targets once, store in plan
     layer_target = _extract_layer_target(q)
     type_target = _extract_type_target(q)
 
-    # Direct object answering
-    if re.search(r"\bhow many\b|\bkaç\b|\badet\b", ql) and OBJ_INTENT_RE.search(q):
-        # explicit targets win
+    # intent flags
+    is_obj_intent = OBJ_INTENT_RE.search(q) is not None
+    is_doc_rule_intent = DOC_RULE_INTENT_RE.search(q) is not None
+    wants_yesno = (YESNO_INTENT_RE.search(q) is not None) or ("yes/no" in ql)
+    wants_presence = PRESENCE_INTENT_RE.search(q) is not None
+
+    # --- Direct object answering: counts ---
+    if re.search(r"\bhow many\b|\bkaç\b|\badet\b", ql) and is_obj_intent:
         if layer_target is not None:
             strategy = "direct_object_layer_count"
         elif type_target is not None:
             strategy = "direct_object_type_count"
         else:
-            # fallback heuristics (keep your old behavior)
+            # fallback heuristics
             if ("window" in ql or "windows" in ql or "pencere" in ql) or ("highway" in ql):
                 strategy = "direct_object_layer_count"
             elif ("polyline" in ql or re.search(r"\bline\b", ql)):
@@ -222,8 +249,21 @@ def node_router(state: GraphState) -> GraphState:
             else:
                 strategy = "direct_object_count"
 
+    # ✅ NEW: Object + Doc hybrid question that explicitly asks YES/NO about presence on a layer
+    # Example:
+    # "Using page 14 rule AND my session objects: do I have any object on the 'Highway' layer? Answer YES/NO + quote from page 14."
+    if (asked_page is not None) and is_obj_intent and is_doc_rule_intent and (wants_yesno or wants_presence):
+        # if layer target wasn't extracted, use a small heuristic:
+        if layer_target is None:
+            if "highway" in ql:
+                layer_target = "Highway"
+            elif "window" in ql or "windows" in ql:
+                layer_target = "Windows"
+        strategy = "direct_object_layer_presence_with_doc_quote"
+
     # Direct doc span when page+rule signal is strong
-    if strategy == "text_only" and asked_page is not None and DOC_RULE_INTENT_RE.search(q):
+    # ✅ FIX: Only allow doc-only shortcut when the question is NOT object-related
+    if strategy == "text_only" and asked_page is not None and is_doc_rule_intent and (not is_obj_intent):
         strategy = "direct_doc_span"
 
     plan = {
@@ -231,7 +271,6 @@ def node_router(state: GraphState) -> GraphState:
         "asked_page": asked_page,
         "has_caption": bool(caps),
         "strategy": strategy,
-        # ✅ NEW: include dynamic targets in plan
         "layer_target": layer_target,
         "type_target": type_target,
     }
@@ -341,7 +380,6 @@ def _extract_restriction_sentence(excerpt: str) -> Optional[str]:
         return None
 
     tail = ex[idx:]
-    # cut to first period if exists (or cap length)
     m = re.search(r"\.", tail)
     if m:
         sent = tail[: m.start() + 1]
@@ -358,6 +396,7 @@ def node_direct_answer(state: GraphState) -> GraphState:
     """
     Executes direct_* strategies without calling the LLM.
     - direct_object_count / direct_object_layer_count / direct_object_type_count
+    - direct_object_layer_presence_with_doc_quote (NEW)
     - direct_doc_span (summarize from best text hit, keep quote evidence)
     """
     plan = state.get("plan") or {}
@@ -382,7 +421,6 @@ def node_direct_answer(state: GraphState) -> GraphState:
         }
 
     if strategy == "direct_object_layer_count":
-        # ✅ NEW: read from plan first (computed in router)
         layer_target = (plan.get("layer_target") or "").strip() or None
 
         # fallback heuristics
@@ -407,7 +445,6 @@ def node_direct_answer(state: GraphState) -> GraphState:
         }
 
     if strategy == "direct_object_type_count":
-        # ✅ NEW: read from plan first
         type_target = (plan.get("type_target") or "").strip() or None
 
         if type_target is None:
@@ -428,6 +465,44 @@ def node_direct_answer(state: GraphState) -> GraphState:
             "direct_evidence": [],
             "used_hits": hits,
             "plan": {**plan, "strategy": "direct_object_type_count", "type_target": type_target},
+        }
+
+    # ✅ NEW: direct YES/NO layer presence + quote from asked page
+    if strategy == "direct_object_layer_presence_with_doc_quote":
+        asked_page = plan.get("asked_page")
+        layer_target = (plan.get("layer_target") or "").strip() or None
+
+        if layer_target is None:
+            if "highway" in ql:
+                layer_target = "Highway"
+            elif "window" in ql or "windows" in ql:
+                layer_target = "Windows"
+
+        count = 0
+        if layer_target:
+            for k, v in by_layer.items():
+                if str(k).lower() == layer_target.lower():
+                    count = _safe_int(v, 0)
+                    break
+
+        yesno = "YES" if count > 0 else "NO"
+
+        best = _best_text_hit(hits, asked_page)
+        evidence = []
+        used_hits = hits
+        if best:
+            chunk_id = best.get("chunk_id")
+            excerpt = _clean_ws(best.get("text") or "")
+            restr = _extract_restriction_sentence(excerpt)
+            quote = (restr or excerpt)[:180] if (restr or excerpt) else ""
+            evidence = [{"source_id": 1, "chunk_id": chunk_id, "quote": quote}]
+            used_hits = [best]
+
+        return {
+            "direct_answer": yesno,  # IMPORTANT: only YES/NO
+            "direct_evidence": evidence,
+            "used_hits": used_hits,
+            "plan": {**plan, "strategy": "direct_object_layer_presence_with_doc_quote", "layer_target": layer_target},
         }
 
     # --- direct doc span ---
@@ -453,19 +528,14 @@ def node_direct_answer(state: GraphState) -> GraphState:
             else:
                 ans = (excerpt[:200].rstrip() + ".") if excerpt else "I don't have enough information in the provided excerpts."
 
-        # ✅ quote iyileştirmesi
-        if restr:
-            quote = restr[:180]
-        else:
-            quote = excerpt[:180] if len(excerpt) > 180 else excerpt
+        quote = (restr or excerpt)[:180] if (restr or excerpt) else ""
 
         return {
             "direct_answer": ans,
             "direct_evidence": [{"source_id": 1, "chunk_id": chunk_id, "quote": quote}],
-            "used_hits": [best],  # IMPORTANT: evidence source_id mapping
+            "used_hits": [best],
             "plan": {**plan, "strategy": "direct_doc_span"},
         }
-
 
     return {}
 
@@ -515,14 +585,14 @@ def node_parse_and_validate(state: GraphState) -> GraphState:
 
     # Validate evidence against the SAME hits used for SOURCE numbering
     try:
-        parsed = validate_evidence(parsed, used_hits)
+        parsed = validate_evidence(parsed, used_hits, state.get("question"))
     except Exception:
         parsed = {"answer": "I don't have enough information in the provided excerpts.", "evidence": []}
 
     answer = parsed.get("answer") or "I don't have enough information in the provided excerpts."
     evidence = parsed.get("evidence") or []
 
-    # ✅ IMPORTANT: direct_* strategies do NOT require evidence
+    # direct_* strategies do NOT require evidence
     if (not evidence) and (not strategy.startswith("direct_")):
         answer = "I don't have enough information in the provided excerpts."
         evidence = []

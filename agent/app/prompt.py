@@ -9,6 +9,16 @@ VISUAL_INTENT_RE = re.compile(
 
 PAGE_RE = re.compile(r"\b(?:page|p\.?|sayfa)\s*#?\s*(\d{1,3})\b", re.IGNORECASE)
 
+# NEW: strict output-intent detection
+YESNO_ONLY_RE = re.compile(
+    r"\b(answer\s+yes\/no|answer\s+(yes|no)|reply\s+with\s+only\s+(yes|no)|yes\/no|evet\/hayir|evet\s*mi\s*hayir\s*mi)\b",
+    re.IGNORECASE,
+)
+NUMBER_ONLY_RE = re.compile(
+    r"\b(reply\s+with\s+only\s+the\s+number|only\s+the\s+number|sadece\s+sayı|yalnızca\s+sayı|yalnızca\s+rakam)\b",
+    re.IGNORECASE,
+)
+
 MAX_EXCERPT = 700
 MAX_QUOTE = 180
 MAX_CANDIDATES = 8
@@ -62,7 +72,6 @@ def _make_quote_candidates(excerpt: str) -> List[str]:
             p = _clean_ws(p)
             if not p:
                 continue
-            # başlık çok anlamsızsa atla
             if p.lower().startswith("figure/table caption"):
                 continue
             if len(p) > MAX_QUOTE:
@@ -149,8 +158,10 @@ def build_prompt(question: str, object_summary: Dict[str, Any], retrieved: List[
 
     context = "\n\n".join(ctx_blocks) if ctx_blocks else "NO_EXCERPTS_FOUND"
 
+    # Allow evidence to be empty for purely object-based direct answers,
+    # but for any document claim we need evidence.
     schema = {
-        "answer": "string (max 3 sentences)",
+        "answer": "string (max 3 sentences, unless strict YES/NO or number-only is requested)",
         "evidence": [{"source_id": 1, "chunk_id": "string", "quote": "string (<=180 chars)"}],
     }
 
@@ -158,38 +169,49 @@ def build_prompt(question: str, object_summary: Dict[str, Any], retrieved: List[
     visual_intent = VISUAL_INTENT_RE.search(question or "") is not None
     asked_page = _asked_page(question)
 
+    yesno_only = YESNO_ONLY_RE.search(question or "") is not None
+    number_only = NUMBER_ONLY_RE.search(question or "") is not None
+
     return f"""You are a hybrid RAG QA agent.
 
 Return ONLY valid JSON (no markdown, no backticks).
 
-OBJECT_SUMMARY (session-only; DO NOT use it for document facts):
+OBJECT_SUMMARY (session-only; OK to use it for object counting/presence, NOT for document facts):
 {obj_json}
 
 SOURCE KIND:
 - kind=text    => extracted PDF text
 - kind=caption => generated from a page image (diagram/table/figure)
 
-RULES:
+STRICT OUTPUT MODES:
+- If the question requests YES/NO only (yesno_only={str(yesno_only).lower()}), then answer MUST be exactly "YES" or "NO" (no extra words).
+- If the question requests number-only (number_only={str(number_only).lower()}), then answer MUST be only digits (e.g., "3"), nothing else.
+
+DOCUMENT RULES:
 - Use ONLY the SOURCES for factual claims about the document.
 - If asked_page={asked_page} is not None, prefer SOURCES from that page.
 - If visual_intent=true and there is at least one kind=caption source:
   - Answer MUST primarily summarize caption content.
-- Do NOT copy-paste long excerpt fragments as the answer; summarize in 1–2 sentences.
-- Every sentence in "answer" MUST be supported by evidence.
 - Use kind=caption for "what is shown"; use kind=text for rules/measurements/definitions.
 
-Evidence rules:
-- evidence.quote MUST be copied EXACTLY from quote_candidates (preferred) OR exact substring of excerpt.
+OBJECT RULES:
+- You may use OBJECT_SUMMARY for: counts, presence/absence per layer/type, simple aggregations.
+- If you mention object facts, they MUST be consistent with OBJECT_SUMMARY.
+
+EVIDENCE RULES:
+- Evidence is required for any document-derived claim.
+- evidence.quote MUST be copied EXACTLY from quote_candidates (preferred) OR an exact substring of excerpt.
 - quote length <= 180 chars.
 - Max 2 evidence items.
 - evidence.source_id must match SOURCE number.
 - evidence.chunk_id must match that SOURCE chunk_id.
+- If the question explicitly asks for a quote from page X, provide at least one evidence item from that page if available.
 
 IMPORTANT (visual questions):
 - If the question asks about a diagram/figure/table AND there is NO kind=caption source, output EXACTLY:
   {{ "answer": "I don't have enough information in the provided excerpts.", "evidence": [] }}
 
-If you cannot support any answer with an exact quote, output EXACTLY:
+If you cannot support any document claim with an exact quote, output EXACTLY:
 {{ "answer": "I don't have enough information in the provided excerpts.", "evidence": [] }}
 
 Question visual_intent={str(visual_intent).lower()} has_caption={str(has_caption).lower()}
