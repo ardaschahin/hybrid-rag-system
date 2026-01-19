@@ -113,9 +113,9 @@ test-backend:
 
 test-auth:
 	@echo "Register/login test user (safe if already exists)..."
-	@curl -fsS -X POST "$(BACKEND_URL)/auth/register" \
+	@curl -sS -X POST "$(BACKEND_URL)/auth/register" \
 	  -H "Content-Type: application/json" \
-	  -d '{"email":"$(DEMO_EMAIL)","password":"$(DEMO_PASS)"}' >/dev/null || true
+	  -d '{"email":"$(DEMO_EMAIL)","password":"$(DEMO_PASS)"}' >/dev/null 2>&1 || true
 	@TOKEN=$$(curl -fsS -X POST "$(BACKEND_URL)/auth/login" \
 	  -H "Content-Type: application/json" \
 	  -d '{"email":"$(DEMO_EMAIL)","password":"$(DEMO_PASS)"}' | \
@@ -123,25 +123,17 @@ test-auth:
 	echo "$$TOKEN" | head -c 20 >/dev/null ; \
 	echo "OK: auth"
 
+# FIX: avoid heredoc in Make recipes; use repo file directly
 test-objects:
 	@echo "Update objects for demo user..."
 	@TOKEN=$$(curl -fsS -X POST "$(BACKEND_URL)/auth/login" \
 	  -H "Content-Type: application/json" \
 	  -d '{"email":"$(DEMO_EMAIL)","password":"$(DEMO_PASS)"}' | \
 	  python -c "import sys,json; print(json.load(sys.stdin)['access_token'])"); \
-	cat > /tmp/sample_objects.json <<'JSON' ; \
-{ \
-  "object_list": [ \
-    {"type":"LINE","layer":"Highway","start":[0,0],"end":[10,0]}, \
-    {"type":"POLYLINE","layer":"Windows","points":[[1,1],[2,1]],"closed":false}, \
-    {"type":"POLYLINE","layer":"Windows","points":[[3,1],[4,1]],"closed":false} \
-  ] \
-} \
-JSON \
 	curl -fsS -X PUT "$(BACKEND_URL)/session/objects" \
 	  -H "Authorization: Bearer $$TOKEN" \
 	  -H "Content-Type: application/json" \
-	  -d @/tmp/sample_objects.json >/dev/null ; \
+	  -d @sample_objects.json >/dev/null ; \
 	echo "OK: objects updated"
 
 test-qa:
