@@ -1,15 +1,16 @@
+# Hybrid RAG (Persistent PDF + Ephemeral Session Objects)
 
 This repository implements a **hybrid Retrieval-Augmented Generation (RAG)** system that answers questions using:
 
 * **Persistent knowledge**: a pre-embedded PDF stored in **ChromaDB** (`./chroma_db`, committed in the repo)
-* **Ephemeral knowledge**: a **session-specific JSON object list** (stored in backend session memory; NOT embedded)
+* **Ephemeral knowledge**: a **session-specific JSON object list** (stored in backend session memory; **NOT** embedded)
 
-Architecture (Dockerized):
+Dockerized architecture:
 
 * **frontend** (React + Nginx): UI → `http://localhost:8080`
 * **backend** (FastAPI): auth + session + routing → `http://localhost:8000`
 * **agent** (FastAPI + LangGraph): hybrid RAG reasoning → `http://localhost:8001`
-* **ollama**: local LLM/VLM inside Docker network (not exposed to host)
+* **ollama**: local LLM/VLM inside Docker network (**not exposed to host**)
 
 ---
 
@@ -26,11 +27,46 @@ If any of these ports are already in use, stop the conflicting services or chang
 
 ---
 
-## Quickstart (Reviewer)
-
-### 1) Start services
+## Quickstart (Reviewer) — one command
 
 From the repo root:
+
+```bash
+make up
+```
+
+This will build + start all services and (optionally) prompt to download Ollama models.
+
+Then:
+
+```bash
+make health
+make open
+```
+
+Optional end-to-end check:
+
+```bash
+make test
+```
+
+Stop services (keeps downloaded models):
+
+```bash
+make down
+```
+
+⚠️ Full reset (deletes Ollama models volume!):
+
+```bash
+make reset
+```
+
+---
+
+## Quickstart (Reviewer) — raw Docker commands (no Makefile)
+
+### 1) Start services
 
 ```bash
 docker compose up -d --build ollama agent backend frontend
@@ -49,15 +85,26 @@ Expected:
 * agent: `{"status":"ok","service":"agent"}`
 * backend: `{"status":"ok","service":"backend"}`
 
----
-
 ### 2) Download models (first run)
 
-**Required.** Models are stored in a Docker volume (`ollama_data`). If you run `docker compose down -v`, models will be removed and must be re-downloaded.
+**Required for answering document questions (LLM).** Models are stored in a Docker volume (`ollama_data`).
+If you run `docker compose down -v` (or `make reset`), models will be removed and must be re-downloaded.
+
+**Minimal (recommended for reviewers):**
 
 ```bash
 docker compose exec -T ollama ollama pull llama3.1:8b
+```
+
+**Optional (only needed if you re-run ingestion with VLM captions):**
+
+```bash
 docker compose exec -T ollama ollama pull llava:13b
+```
+
+Check:
+
+```bash
 docker compose exec -T ollama ollama list
 ```
 
@@ -83,7 +130,7 @@ Example credentials:
 
 ### 2) Paste sample objects
 
-In the UI “Object List” textarea paste:
+In the UI “Object List” textarea paste (same content as `./sample_objects.json`):
 
 ```json
 {
@@ -100,7 +147,7 @@ In the UI “Object List” textarea paste:
 **A) Object-only (ephemeral)**
 
 1. `How many objects are in my current session object_list? Reply with only the number.`
-   Expected answer: `3`
+   Expected: `3`
 
 Then update object list to ONLY Highway:
 
@@ -111,18 +158,24 @@ Then update object list to ONLY Highway:
 Ask again → expected: `1`
 
 **B) Doc-only (persistent RAG)**
-2) `On page 14, what is the restriction about the principal elevation and highway? 1-2 sentences.`
-Expected: answer supported by a quote from page 14.
+
+2. `On page 14, what is the restriction about the principal elevation and highway? 1-2 sentences.`
+   Expected: answer supported by a quote from page 14.
 
 **C) Hybrid (doc + objects together)**
-3) `Using the page 14 rule AND my session objects: do I have any object on the "Highway" layer? Answer YES/NO and include a short quote from page 14 as evidence.`
 
-* With Highway present → expected: `YES` (+ quote)
-* Remove Highway from object list (leave only Windows) → expected: `NO` (+ same doc quote)
+3. `Using the page 14 rule AND my session objects: do I have any object on the "Highway" layer? Answer YES/NO and include a short quote from page 14 as evidence.`
 
-**D) Visual question (bonus: VLM captions used in retrieval)**
-4) `What does the diagram on page 38 show?`
-Expected: retrieval includes at least one `kind=caption` source.
+* With Highway present → expected: `YES` (+ quote from page 14)
+* Remove Highway from object list (leave only Windows) → expected: `NO` (+ quote from page 14)
+
+**D) Visual question (bonus: captions used in retrieval)**
+
+4. `What does the diagram on page 38 show?`
+   Expected: response shows at least one source with `kind=caption`.
+
+> Note: captions are already in the committed `./chroma_db`, so this works out-of-the-box.
+> The **llava** model is only needed if you want to **re-run ingestion** with captions.
 
 ---
 
@@ -145,21 +198,13 @@ echo "$TOKEN" | head -c 20; echo
 
 ### 2) Update session objects (PUT)
 
-```bash
-cat > /tmp/sample_objects.json <<'JSON'
-{
-  "object_list": [
-    {"type":"LINE","layer":"Highway","start":[0,0],"end":[10,0]},
-    {"type":"POLYLINE","layer":"Windows","points":[[1,1],[2,1]],"closed":false},
-    {"type":"POLYLINE","layer":"Windows","points":[[3,1],[4,1]],"closed":false}
-  ]
-}
-JSON
+You can use the provided file `./sample_objects.json` directly:
 
+```bash
 curl -sS -X PUT "http://localhost:8000/session/objects" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d @/tmp/sample_objects.json | jq .
+  -d @sample_objects.json | jq .
 ```
 
 Verify:
@@ -187,7 +232,7 @@ curl -sS -X POST "http://localhost:8000/qa" \
   -d '{"question":"How many objects are in my current session object_list? Reply with only the number.","top_k":3}' | jq -r '.answer'
 ```
 
-Agent direct (doc-only, no session):
+Agent direct (doc-only, no backend/session):
 
 ```bash
 curl -sS -X POST "http://localhost:8001/answer" \
@@ -205,7 +250,7 @@ This repo includes a prebuilt Chroma DB at `./chroma_db`, so **ingestion is NOT 
 
 ### Optional: re-ingest documents (advanced)
 
-If you want to regenerate embeddings:
+Recreate embeddings (uses `EMBED_MODEL`, defaults in `.env.example`):
 
 ```bash
 docker compose run --rm \
@@ -232,8 +277,13 @@ Pull models again:
 
 ```bash
 docker compose exec -T ollama ollama pull llama3.1:8b
-docker compose exec -T ollama ollama pull llava:13b
 docker compose exec -T ollama ollama list
+```
+
+(Optional for ingestion captions)
+
+```bash
+docker compose exec -T ollama ollama pull llava:13b
 ```
 
 ### Agent can’t reach Ollama
@@ -244,7 +294,7 @@ Check from inside agent:
 docker compose exec -T agent python -c "import urllib.request; print(urllib.request.urlopen('http://ollama:11434/api/tags',timeout=10).read()[:200])"
 ```
 
-Expected: a JSON with `"models":[...]`.
+Expected: JSON with `"models":[...]`.
 
 ### “Works for me, not for reviewer”
 
@@ -270,12 +320,8 @@ docker compose down -v
 
 ---
 
-## Notes on security
-
-* `ollama` is NOT published to the host. It is only reachable from containers on the Docker network.
-
----
 
 ## Roadmap
 
-* Add a `Makefile` to provide a single-command flow (with an interactive prompt for downloading large models).
+* Makefile-based “one-command” reviewer flow (already included): `make up`, `make test`, `make ingest(-vlm)`
+* (Optional) improved Makefile prompts for large model downloads / time+disk warnings
